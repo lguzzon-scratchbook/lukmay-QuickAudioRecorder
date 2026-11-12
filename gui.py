@@ -1,4 +1,3 @@
-import sys
 import os
 import json
 import shutil
@@ -15,14 +14,17 @@ import keyboard
 from audio_recorder import AudioRecorder, get_devices
 from clipboard_utils import copy_file_to_clipboard
 
-CONFIG_FILE = "settings.json"
+def data_dir():
+    base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    path = os.path.join(base, "QuickAudioRecorder")
+    os.makedirs(path, exist_ok=True)
+    return path
 
-def resource_path(relative_path):
-    try:
-        base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.abspath(".")
-    return os.path.join(base_path, relative_path)
+CONFIG_FILE = os.path.join(data_dir(), "settings.json")
+
+def hotkey_ok(seq):
+    seq = seq.lower()
+    return "+" in seq or seq in {f"f{i}" for i in range(1, 13)}
 
 class SignalManager(QObject):
     recording_finished = pyqtSignal(str, str)
@@ -38,7 +40,7 @@ class HotkeyEdit(QLineEdit):
     """
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setPlaceholderText("Click to set hotkey...")
+        self.setPlaceholderText("Click to set hotkey (e.g. ctrl+alt+r, f5)")
         self.setReadOnly(True) 
         self.current_sequence = None
 
@@ -96,10 +98,12 @@ class HotkeyEdit(QLineEdit):
                 try: key_text = QKeySequence(key).toString().lower()
                 except: pass
 
-        if key_text:
-            parts.append(key_text)
-            
+        if not key_text:
+            return
+        parts.append(key_text)
         final_hotkey = "+".join(parts)
+        if not hotkey_ok(final_hotkey):
+            return
         self.setText(final_hotkey)
         self.current_sequence = final_hotkey
         self.clearFocus()
@@ -226,9 +230,13 @@ class SettingsWindow(QMainWindow):
             self.lbl_folder.setText(folder)
 
     def load_settings(self):
-        if os.path.exists(CONFIG_FILE):
+        path = CONFIG_FILE
+        legacy = not os.path.exists(path) and os.path.exists("settings.json")
+        if legacy:
+            path = "settings.json"
+        if os.path.exists(path):
             try:
-                with open(CONFIG_FILE, 'r') as f:
+                with open(path, 'r') as f:
                     data = json.load(f)
                     
                 self.lbl_folder.setText(data.get("output_folder", os.getcwd()))
@@ -256,6 +264,10 @@ class SettingsWindow(QMainWindow):
                 self.hk_loop.setText(data.get("hk_loop", ""))
                 self.hk_both.setText(data.get("hk_both", ""))
                 self.hk_stop.setText(data.get("hk_stop", ""))
+                if legacy:
+                    with open(CONFIG_FILE, 'w') as f:
+                        json.dump(self.get_settings(), f)
+                    os.remove(path)
             except Exception as e:
                 print(f"Error loading settings: {e}")
 
@@ -292,6 +304,7 @@ class TrayApplication(QObject):
         super().__init__()
         self.app = app
         self.recorder = None
+        self.quitting = False
         self.last_mode = "mic" 
         
         self.signals = SignalManager()
@@ -308,8 +321,8 @@ class TrayApplication(QObject):
         self.rec_timer.timeout.connect(self.on_recording_tick)
         self.rec_started = 0
 
-        self.icon_idle_path = resource_path("icon_idle.png")
-        self.icon_rec_path = resource_path("icon_rec.png")
+        self.icon_idle_path = os.path.join(data_dir(), "icon_idle.png")
+        self.icon_rec_path = os.path.join(data_dir(), "icon_rec.png")
         self.generate_icons()
             
         self.tray_icon = QSystemTrayIcon(QIcon(self.icon_idle_path), self.app)
@@ -379,17 +392,22 @@ class TrayApplication(QObject):
         try: keyboard.unhook_all_hotkeys() # Ensure no old hotkeys are active
         except: pass
         settings = self.settings_window.get_settings()
-        hk_mic = settings.get("hk_mic")
-        hk_loop = settings.get("hk_loop")
-        hk_both = settings.get("hk_both")
-        hk_stop = settings.get("hk_stop")
-        try:
-            # keyboard runs callbacks on its own thread, hand them to the Qt thread
-            if hk_mic: keyboard.add_hotkey(hk_mic, lambda: self.signals.hotkey.emit("mic"))
-            if hk_loop: keyboard.add_hotkey(hk_loop, lambda: self.signals.hotkey.emit("loopback"))
-            if hk_both: keyboard.add_hotkey(hk_both, lambda: self.signals.hotkey.emit("both"))
-            if hk_stop: keyboard.add_hotkey(hk_stop, lambda: self.signals.hotkey.emit("stop"))
-        except Exception as e: print(f"Failed to register hotkeys: {e}")
+        for key, mode in ((settings.get("hk_mic"), "mic"),
+                          (settings.get("hk_loop"), "loopback"),
+                          (settings.get("hk_both"), "both"),
+                          (settings.get("hk_stop"), "stop")):
+            if not key:
+                continue
+            if not hotkey_ok(key):
+                self.tray_icon.showMessage("Hotkeys", f"'{key}' needs Ctrl/Alt/Shift/Win or an F-key",
+                                           QSystemTrayIcon.MessageIcon.Warning, 4000)
+                continue
+            try:
+                # keyboard runs callbacks on its own thread, hand them to the Qt thread
+                keyboard.add_hotkey(key, lambda m=mode: self.signals.hotkey.emit(m))
+            except Exception as e:
+                self.tray_icon.showMessage("Hotkeys", f"'{key}' failed to register: {e}",
+                                           QSystemTrayIcon.MessageIcon.Warning, 4000)
 
     def on_hotkey(self, mode):
         # a record hotkey pressed again stops the recording
@@ -518,6 +536,8 @@ class TrayApplication(QObject):
         # a partial recording comes back with a path and an error, keep it and warn
         if error and not (path and os.path.exists(path)):
             self.tray_icon.showMessage("Error", f"Recording failed: {error}", QSystemTrayIcon.MessageIcon.Critical, 4000)
+            if self.quitting:
+                self.app.quit()
             return
             
         settings = self.settings_window.get_settings()
@@ -552,7 +572,12 @@ class TrayApplication(QObject):
                 msg += f"\nClipboard/Move error: {e}"
 
         self.notify("Finished", msg, QSystemTrayIcon.MessageIcon.Information, 2000)
+        if self.quitting:
+            self.app.quit()
 
     def exit_app(self):
-        if self.recorder: self.recorder.stop()
-        self.app.quit()
+        self.quitting = True
+        if self.recorder:
+            self.recorder.stop()
+        else:
+            self.app.quit()
