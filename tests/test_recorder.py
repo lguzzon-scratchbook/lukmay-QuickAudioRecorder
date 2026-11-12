@@ -149,6 +149,26 @@ def test_normalize_levels_quiet_mic_against_loud_system_audio(fake_sc, tmp_path)
     assert 0.5 < mic / system < 2
 
 
+def test_normalize_both_does_not_clip(tmp_path):
+    import audio_recorder
+    sr = 44100
+    t = np.arange(sr) / sr
+    x = (0.9 * np.sin(2 * np.pi * 440 * t)).astype("float32")
+    z = (0.9 * np.sin(2 * np.pi * 1000 * t)).astype("float32")
+    a, b = tmp_path / "a.wav", tmp_path / "b.wav"
+    sf.write(a, x, sr)
+    sf.write(b, z, sr)
+
+    rec = audio_recorder.AudioRecorder("x", "both", str(tmp_path),
+                                       output_format="wav", normalize=True)
+    out = tmp_path / "out.wav"
+    with sf.SoundFile(a) as fa, sf.SoundFile(b) as fb:
+        rec._write_output([fa, fb], str(out))
+    data, _ = sf.read(out)
+    expected = (x + z) * (0.99 / np.abs(x + z).max())
+    assert np.abs(data - expected).max() < 1e-3
+
+
 @pytest.mark.parametrize("normalize", [False, True])
 def test_saving_reports_progress_up_to_done(fake_sc, tmp_path, normalize):
     steps = []

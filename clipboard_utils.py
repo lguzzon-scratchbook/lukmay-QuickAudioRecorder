@@ -16,13 +16,15 @@ def copy_file_to_clipboard(filepath):
 
     # Strategy 1: PowerShell (Native / Robust)
     # Set-Clipboard -Path "..." mimics Explorer copy perfectly.
+    # Single quotes in the path are doubled, the PowerShell escape for them.
     try:
+        escaped = filepath.replace("'", "''")
         cmd = [
             "powershell", 
             "-NoProfile", 
             "-NonInteractive", 
             "-Command", 
-            f"Set-Clipboard -Path '{filepath}'"
+            f"Set-Clipboard -LiteralPath '{escaped}'"
         ]
         
         # subprocess.run ensures we wait for it to finish

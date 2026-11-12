@@ -25,17 +25,24 @@ class FakeStream:
         return self
 
     def __exit__(self, *exc):
+        self.device.closed_while_reading = self.device.reading
         return False
 
     def record(self, numframes):
-        if self.device.die_after is not None and self.pos >= self.device.die_after:
-            raise RuntimeError("device lost")
-        # pace like a real device so a recording thread doesn't spin
-        time.sleep(numframes / self.samplerate / self.device.speed)
-        t = (np.arange(numframes) + self.pos) / self.samplerate
-        self.pos += numframes
-        tone = self.device.amplitude * np.sin(2 * np.pi * self.device.freq * t)
-        return np.repeat(tone[:, None], self.channels, axis=1).astype(np.float32)
+        self.device.reading = True
+        try:
+            if self.device.die_after is not None and self.pos >= self.device.die_after:
+                raise RuntimeError("device lost")
+            if self.device.hang_after is not None and self.pos >= self.device.hang_after:
+                threading.Event().wait()
+            # pace like a real device so a recording thread doesn't spin
+            time.sleep(numframes / self.samplerate / self.device.speed)
+            t = (np.arange(numframes) + self.pos) / self.samplerate
+            self.pos += numframes
+            tone = self.device.amplitude * np.sin(2 * np.pi * self.device.freq * t)
+            return np.repeat(tone[:, None], self.channels, axis=1).astype(np.float32)
+        finally:
+            self.device.reading = False
 
 
 class FakeDevice:
@@ -43,7 +50,7 @@ class FakeDevice:
 
     def __init__(self, name, freq=440.0, amplitude=0.5, channels=2,
                  isloopback=False, speed=20.0, fail_with=None, rates=None,
-                 die_after=None):
+                 die_after=None, hang_after=None):
         self.name = name
         self.id = name
         self.freq = freq
@@ -54,6 +61,9 @@ class FakeDevice:
         self.fail_with = fail_with
         self.rates = rates
         self.die_after = die_after  # frames recorded before it gets unplugged
+        self.hang_after = hang_after  # frames recorded before it stops delivering
+        self.reading = False
+        self.closed_while_reading = False
 
     def recorder(self, samplerate, channels=None, blocksize=None):
         if self.rates is not None and samplerate not in self.rates:

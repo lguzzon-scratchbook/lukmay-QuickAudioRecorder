@@ -54,3 +54,46 @@ def test_unplug_before_any_audio_still_fails(fake_sc, tmp_path):
 
     assert not path
     assert "device lost" in error
+
+
+def test_hung_device_stops_by_itself_and_saves(fake_sc, tmp_path):
+    """A device that stops delivering without dying must not wedge the app."""
+    fake_sc.mic.hang_after = 44100
+    done = threading.Event()
+    result = {}
+
+    def on_finish(path, error):
+        result["path"], result["error"] = path, error
+        done.set()
+
+    rec = audio_recorder.AudioRecorder(
+        mic_id="Fake Mic", source_mode="mic", output_folder=str(tmp_path),
+        output_format="wav", on_finish_callback=on_finish)
+    rec.start()
+    assert done.wait(15), "the recording kept running after the device hung"
+    assert os.path.exists(result["path"])
+    assert "stalled" in result["error"]
+    data, _ = sf.read(result["path"])
+    assert len(data) >= 44100
+
+
+def test_device_closes_only_after_reads_finish(fake_sc, tmp_path):
+    """soundcard frees COM pointers on close; an in-flight read would crash."""
+    path, error = record(tmp_path, "mic", seconds=0.5, output_format="wav")
+    assert not error
+    assert not fake_sc.mic.closed_while_reading
+
+
+def test_stop_flags_wedged_recorder(tmp_path, monkeypatch):
+    import audio_recorder
+
+    class Wedged(audio_recorder.RawRecorder):
+        def run(self):
+            threading.Event().wait()
+
+    r = Wedged(None, str(tmp_path / "x.wav"))
+    r.daemon = True
+    monkeypatch.setattr(r, "join", lambda timeout=None: threading.Thread.join(r, timeout=0.1))
+    r.start()
+    r.stop()
+    assert r.error, "a recorder that never stopped must not look successful"

@@ -112,17 +112,46 @@ class RawRecorder(threading.Thread):
             samplerate, channels = self.samplerate, self.channels
             with sf.SoundFile(self.filepath, mode='w', samplerate=samplerate, channels=channels) as f_wav:
                 with self.device.recorder(samplerate=samplerate, channels=channels) as mic:
-                    while not self.stop_event.is_set():
-                        data = mic.record(numframes=2048)
-                        f_wav.write(data)
-                        self.frames += len(data)
+                    blocks = queue.Queue(maxsize=50)
+
+                    def pump():
+                        try:
+                            while not self.stop_event.is_set():
+                                data = mic.record(numframes=2048)
+                                try:
+                                    blocks.put(data, timeout=1)
+                                except queue.Full:
+                                    pass
+                        except Exception as e:
+                            try:
+                                blocks.put(e, timeout=1)
+                            except queue.Full:
+                                pass
+
+                    reader = threading.Thread(target=pump, daemon=True)
+                    reader.start()
+                    try:
+                        while not self.stop_event.is_set():
+                            try:
+                                data = blocks.get(timeout=2)
+                            except queue.Empty:
+                                raise TimeoutError(f"device '{self.device.name}' stalled")
+                            if isinstance(data, Exception):
+                                raise data
+                            f_wav.write(data)
+                            self.frames += len(data)
+                    finally:
+                        self.stop_event.set()
+                        reader.join(timeout=2)
         except Exception as e:
             # an unplugged device ends up here, the WAV keeps what was written
             self.error = str(e) or type(e).__name__
 
     def stop(self):
         self.stop_event.set()
-        self.join()
+        self.join(timeout=10)
+        if self.is_alive():
+            self.error = "device did not release in time"
 
 class AudioRecorder(threading.Thread):
     """
@@ -332,7 +361,7 @@ class AudioRecorder(threading.Thread):
             for s, ratio, g in zip(sources, ratios, gains):
                 # mono into stereo: same signal on both sides
                 mixed += g * self._read_block(s, start, count, ratio)
-            yield np.clip(mixed, -1.0, 1.0)
+            yield mixed
 
     def _write_output(self, sources, path):
         samplerate, channels, length, _ = self._plan_mix(sources)
@@ -393,7 +422,7 @@ class AudioRecorder(threading.Thread):
             # WAV or FLAC, soundfile picks the container from the extension
             with sf.SoundFile(path, 'w', samplerate=samplerate, channels=channels) as f_out:
                 for b in blocks():
-                    f_out.write(tick(b, write_cost) * gain)
+                    f_out.write(np.clip(tick(b, write_cost) * gain, -1.0, 1.0))
 
 def get_devices(include_loopback=False):
     try:
